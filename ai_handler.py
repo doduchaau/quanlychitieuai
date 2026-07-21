@@ -1,29 +1,42 @@
 import os
 import json
 import tempfile
-import google.generativeai as genai
 from typing import Dict, Any, Optional
+from openai import OpenAI, AsyncOpenAI
 
+# ==================== CẤU HÌNH ====================
+AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").lower()  # groq | gemini
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("Thiếu GEMINI_API_KEY!")
 
-genai.configure(api_key=GEMINI_API_KEY)
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Model mặc định
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_WHISPER_MODEL = "whisper-large-v3"
 
-model = genai.GenerativeModel(
-    model_name=MODEL_NAME,
-    generation_config={
-        "temperature": 0.2,
-        "max_output_tokens": 900,
-        "response_mime_type": "application/json",
-    }
-)
+# Client
+client = None
+
+if AI_PROVIDER == "groq":
+    if not GROQ_API_KEY:
+        raise ValueError("Thiếu GROQ_API_KEY! Lấy key miễn phí tại https://console.groq.com/keys")
+    client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1"
+    )
+    print(f"[AI] Đang dùng Groq - model: {GROQ_MODEL}")
+else:
+    # Fallback Gemini (nếu user muốn)
+    import google.generativeai as genai
+    if not GEMINI_API_KEY:
+        raise ValueError("Thiếu GEMINI_API_KEY!")
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("[AI] Đang dùng Gemini")
+
 
 SYSTEM_PROMPT = """Bạn là trợ lý tài chính thông minh cho người Việt Nam, chuyên quản lý thu chi cá nhân qua Telegram.
 
 NHIỆM VỤ:
-Phân tích tin nhắn (text / thoại / ảnh hóa đơn) và trả về JSON hành động phù hợp.
+Phân tích tin nhắn và trả về JSON hành động phù hợp.
 
 CÁC ACTION HỖ TRỢ:
 - add_transaction: Thêm thu/chi (params: type, amount, category, description, wallet_name?)
@@ -34,7 +47,7 @@ CÁC ACTION HỖ TRỢ:
 - get_report: Báo cáo thu chi
 - get_chart: Biểu đồ (params: chart_type = "category" | "daily" | "income_expense")
 - get_prediction: Dự đoán chi tiêu tháng
-- create_wallet: Tạo ví mới (params: name, type?)  type = cash|bank|momo|zalopay|credit|other
+- create_wallet: Tạo ví mới (params: name, type?)
 - list_wallets: Xem danh sách ví + số dư
 - transfer: Chuyển tiền giữa 2 ví (params: from_wallet, to_wallet, amount, description?)
 - set_remind: Bật/tắt nhắc nhở
@@ -51,56 +64,31 @@ DANH MỤC phổ biến:
 Thu: Lương, Thưởng, Đầu tư, Kinh doanh, Quà tặng, Khác
 Chi: Ăn uống, Di chuyển, Nhà cửa, Hóa đơn, Mua sắm, Giải trí, Sức khỏe, Giáo dục, Du lịch, Khác
 
-VÍ MẶC ĐỊNH: "Tiền mặt".
+QUY TẮC VIẾT TẮT VÍ (phải mở rộng thành tên đầy đủ):
+- VT, VTB, Viettin, Vietin → "VietinBank"
+- VCB, Vietcom → "Vietcombank"
+- TCB, Techcom → "Techcombank"
+- MB, MBB → "MB Bank"
+- ACB, BIDV, VPB, TPB, STB, AGR...
+- MoMo, ZaloPay, ShopeePay, ViettelPay
+- TM, Tiền mặt → "Tiền mặt"
 
-QUY TẮC VIẾT TẮT VÍ / NGÂN HÀNG (rất quan trọng - phải mở rộng viết tắt thành tên đầy đủ):
-- VT, VTB, Viettin, Viettinbank, Vietin → "VietinBank"
-- VCB, Vietcom, Vietcombank → "Vietcombank"
-- TCB, Techcom, Techcombank → "Techcombank"
-- MB, MBB, MBBank → "MB Bank"
-- ACB → "ACB"
-- BIDV → "BIDV"
-- VPB, VPBank → "VPBank"
-- TPB, TPBank → "TPBank"
-- STB, Sacombank → "Sacombank"
-- AGR, Agribank → "Agribank"
-- MoMo, momo, Momo → "MoMo"
-- ZaloPay, zalopay, Zalo → "ZaloPay"
-- ShopeePay, Shopee → "ShopeePay"
-- ViettelPay, Viettel → "ViettelPay"
-- TM, Tien mat, Cash → "Tiền mặt"
-
-Khi user nói viết tắt, LUÔN dùng tên đầy đủ ở trên trong params (wallet_name, from_wallet, to_wallet, name).
-
-ĐỊNH DẠNG BẮT BUỘC (chỉ JSON thuần):
+ĐỊNH DẠNG BẮT BUỘC (chỉ trả JSON thuần, không markdown):
 {
   "action": "tên_action",
   "params": { ... },
-  "reply": "Tin nhắn thân thiện bằng tiếng Việt có emoji (để rỗng nếu cần lấy data từ DB)"
+  "reply": "Tin nhắn thân thiện bằng tiếng Việt có emoji"
 }
 
 VÍ DỤ:
-
 User: "chi 45k cafe bằng MoMo"
 → {"action":"add_transaction","params":{"type":"expense","amount":45000,"category":"Ăn uống","description":"Cafe","wallet_name":"MoMo"},"reply":"✅ Đã ghi nhận chi **45.000₫** cho *Cafe* từ ví MoMo"}
 
-User: "tạo ví VT" hoặc "tạo ví Viettinbank"
+User: "tạo ví VT"
 → {"action":"create_wallet","params":{"name":"VietinBank","type":"bank"},"reply":"🆕 Đã tạo ví **VietinBank** thành công!"}
 
-User: "tạo ví VCB"
-→ {"action":"create_wallet","params":{"name":"Vietcombank","type":"bank"},"reply":"🆕 Đã tạo ví **Vietcombank** thành công!"}
-
-User: "chuyển 500k từ tiền mặt sang VT"
-→ {"action":"transfer","params":{"from_wallet":"Tiền mặt","to_wallet":"VietinBank","amount":500000},"reply":""}
-
-User: "số dư ví TCB"
-→ {"action":"get_balance","params":{"wallet_name":"Techcombank"},"reply":""}
-
-User: "danh sách ví" / "các ví của tôi"
-→ {"action":"list_wallets","params":{},"reply":""}
-
-User: "sửa #12 thành 60k"
-→ {"action":"update_transaction","params":{"tx_id":12,"amount":60000},"reply":""}
+User: "chuyển 500k từ tiền mặt sang VCB"
+→ {"action":"transfer","params":{"from_wallet":"Tiền mặt","to_wallet":"Vietcombank","amount":500000},"reply":""}
 """
 
 
@@ -126,17 +114,38 @@ def _parse_json_response(content: str) -> Dict[str, Any]:
         return {
             "action": "chat",
             "params": {},
-            "reply": "Xin lỗi, mình chưa hiểu rõ. Bạn thử nói: 'chi 50k ăn trưa' hoặc 'số dư' nhé!"
+            "reply": "Xin lỗi, mình chưa hiểu rõ. Bạn thử: 'chi 50k ăn trưa' hoặc 'số dư' nhé!"
         }
 
 
 async def process_message(user_message: str, user_id: int) -> Dict[str, Any]:
+    """Xử lý tin nhắn text"""
     try:
-        prompt = f"{SYSTEM_PROMPT}\n\nTin nhắn của người dùng (user_id={user_id}):\n{user_message}"
-        response = model.generate_content(prompt)
-        return _parse_json_response(response.text)
+        if AI_PROVIDER == "groq":
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"user_id={user_id}\n{user_message}"}
+                ],
+                temperature=0.2,
+                max_tokens=800,
+                response_format={"type": "json_object"}
+            )
+            content = response.choices[0].message.content
+            return _parse_json_response(content)
+        else:
+            # Gemini fallback
+            import google.generativeai as genai
+            model = genai.GenerativeModel(
+                model_name=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                generation_config={"temperature": 0.2, "response_mime_type": "application/json"}
+            )
+            prompt = f"{SYSTEM_PROMPT}\n\nTin nhắn (user_id={user_id}):\n{user_message}"
+            response = model.generate_content(prompt)
+            return _parse_json_response(response.text)
     except Exception as e:
-        print(f"[Gemini Error] {e}")
+        print(f"[AI Error] {e}")
         return {
             "action": "chat",
             "params": {},
@@ -145,111 +154,120 @@ async def process_message(user_message: str, user_id: int) -> Dict[str, Any]:
 
 
 async def process_voice(audio_bytes: bytes, user_id: int, mime_type: str = "audio/ogg") -> Dict[str, Any]:
-    tmp_path = None
-    uploaded_file = None
+    """
+    Tin nhắn thoại:
+    - Groq: dùng Whisper miễn phí chuyển thành text → xử lý như tin nhắn thường
+    - Gemini: multimodal (nếu còn dùng)
+    """
     try:
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp.write(audio_bytes)
-            tmp_path = tmp.name
+        if AI_PROVIDER == "groq":
+            # 1. Transcribe bằng Whisper của Groq
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
 
-        uploaded_file = genai.upload_file(path=tmp_path, mime_type=mime_type)
+            try:
+                with open(tmp_path, "rb") as audio_file:
+                    transcription = client.audio.transcriptions.create(
+                        model=GROQ_WHISPER_MODEL,
+                        file=audio_file,
+                        language="vi"  # ưu tiên tiếng Việt
+                    )
+                text = transcription.text.strip()
+                print(f"[Whisper] Transcript: {text}")
 
-        prompt = f"""{SYSTEM_PROMPT}
+                if not text:
+                    return {
+                        "action": "chat",
+                        "params": {},
+                        "reply": "Mình không nghe rõ tin nhắn thoại. Bạn thử nói lại rõ hơn nhé!"
+                    }
 
-Đây là tin nhắn thoại tiếng Việt từ user_id={user_id}.
-1. Nghe và chuyển thành văn bản tiếng Việt chính xác.
-2. Phân tích như tin nhắn thu chi thông thường.
-3. Trả về ĐÚNG JSON action (chỉ JSON thuần).
-"""
-        response = model.generate_content([prompt, uploaded_file])
-        return _parse_json_response(response.text)
+                # 2. Đưa text vào AI xử lý bình thường
+                result = await process_message(text, user_id)
+                # Thêm thông tin transcript vào reply nếu là chat
+                if result.get("action") == "chat" and text:
+                    result["reply"] = f"🎧 Mình nghe: \"{text}\"\n\n{result.get('reply', '')}"
+                return result
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        else:
+            # Gemini multimodal (giữ lại nếu user dùng Gemini)
+            import google.generativeai as genai
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            try:
+                uploaded = genai.upload_file(path=tmp_path, mime_type=mime_type)
+                model = genai.GenerativeModel(
+                    model_name=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                    generation_config={"temperature": 0.2, "response_mime_type": "application/json"}
+                )
+                prompt = f"{SYSTEM_PROMPT}\n\nĐây là tin nhắn thoại tiếng Việt từ user_id={user_id}. Hãy nghe, chuyển thành text rồi phân tích action."
+                response = model.generate_content([prompt, uploaded])
+                return _parse_json_response(response.text)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
     except Exception as e:
-        print(f"[Gemini Voice Error] {e}")
+        print(f"[Voice Error] {e}")
         return {
             "action": "chat",
             "params": {},
             "reply": f"⚠️ Không nhận diện được tin nhắn thoại: {str(e)[:100]}"
         }
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-        if uploaded_file:
-            try:
-                genai.delete_file(uploaded_file.name)
-            except Exception:
-                pass
 
 
 async def process_image(image_bytes: bytes, user_id: int, mime_type: str = "image/jpeg") -> Dict[str, Any]:
-    """
-    OCR hóa đơn / ảnh → trích xuất số tiền, cửa hàng, gợi ý danh mục → add_transaction
-    """
-    tmp_path = None
-    uploaded_file = None
-    try:
-        suffix = ".jpg" if "jpeg" in mime_type or "jpg" in mime_type else ".png"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(image_bytes)
-            tmp_path = tmp.name
-
-        uploaded_file = genai.upload_file(path=tmp_path, mime_type=mime_type)
-
-        prompt = f"""{SYSTEM_PROMPT}
-
-Đây là ảnh hóa đơn / biên lai / screenshot giao dịch từ user_id={user_id}.
-
-Hãy thực hiện:
-1. Đọc kỹ ảnh (OCR) để lấy:
-   - Tổng số tiền thanh toán (ưu tiên số lớn nhất / "Tổng cộng" / "Total" / "Thành tiền")
-   - Tên cửa hàng / merchant (nếu có)
-   - Ngày tháng (nếu có)
-2. Đoán danh mục phù hợp (Ăn uống, Mua sắm, Di chuyển, Hóa đơn...)
-3. Trả về action "add_transaction" với type="expense".
-
-Ví dụ JSON:
-{{
-  "action": "add_transaction",
-  "params": {{
-    "type": "expense",
-    "amount": 145000,
-    "category": "Ăn uống",
-    "description": "Highland Coffee"
-  }},
-  "reply": "🧾 Đã nhận diện hóa đơn **145.000₫** tại *Highland Coffee* (Ăn uống). Đã ghi nhận!"
-}}
-
-Nếu không đọc được số tiền rõ ràng:
-{{
-  "action": "chat",
-  "params": {{}},
-  "reply": "Mình không đọc rõ số tiền trên ảnh. Bạn có thể nhắn text giúp mình không?"
-}}
-"""
-        response = model.generate_content([prompt, uploaded_file])
-        return _parse_json_response(response.text)
-    except Exception as e:
-        print(f"[Gemini Image Error] {e}")
+    """OCR hóa đơn – hiện chỉ hỗ trợ tốt với Gemini. Groq free chưa có vision."""
+    if AI_PROVIDER == "groq":
         return {
             "action": "chat",
             "params": {},
-            "reply": f"⚠️ Không đọc được ảnh hóa đơn: {str(e)[:100]}"
+            "reply": "📷 Hiện tại đang dùng **Groq** (miễn phí) nên chưa hỗ trợ đọc ảnh hóa đơn.\n\nBạn hãy nhắn text giúp mình, ví dụ:\n`chi 145k Highland Coffee`"
         }
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
+
+    # Gemini vision
+    try:
+        import google.generativeai as genai
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+        try:
+            uploaded = genai.upload_file(path=tmp_path, mime_type=mime_type)
+            model = genai.GenerativeModel(
+                model_name=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                generation_config={"temperature": 0.2, "response_mime_type": "application/json"}
+            )
+            prompt = f"""{SYSTEM_PROMPT}
+
+Đây là ảnh hóa đơn từ user_id={user_id}.
+Hãy OCR lấy số tiền + tên cửa hàng + gợi ý danh mục, rồi trả action add_transaction.
+"""
+            response = model.generate_content([prompt, uploaded])
+            return _parse_json_response(response.text)
+        finally:
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
-        if uploaded_file:
-            try:
-                genai.delete_file(uploaded_file.name)
-            except Exception:
-                pass
+    except Exception as e:
+        print(f"[Image Error] {e}")
+        return {
+            "action": "chat",
+            "params": {},
+            "reply": f"⚠️ Không đọc được ảnh: {str(e)[:100]}"
+        }
 
 
+# ==================== FORMAT ====================
 def format_money(amount: float) -> str:
     if abs(amount) >= 1_000_000:
         return f"{amount/1_000_000:,.2f} triệu".replace(".00", "") + "₫"
@@ -276,7 +294,6 @@ def format_balance(data: Dict, wallet_name: str = None) -> str:
 def format_list(txs: list) -> str:
     if not txs:
         return "📭 Chưa có giao dịch nào."
-
     lines = ["📋 **GIAO DỊCH GẦN NHẤT**\n"]
     for tx in txs:
         icon = "📥" if tx["type"] == "income" else "📤"
@@ -301,24 +318,19 @@ def format_report(data: Dict) -> str:
     expense = format_money(data["expense"])
     balance = format_money(data["balance"])
     emoji = "🟢" if data["balance"] >= 0 else "🔴"
-
     lines = [
         f"📊 **BÁO CÁO {days} NGÀY GẦN NHẤT**\n",
         f"📥 Thu: **{income}**",
         f"📤 Chi: **{expense}**",
         f"{emoji} Chênh lệch: **{balance}**\n"
     ]
-
     if data["by_category"]:
         lines.append("🏷️ **Chi theo danh mục:**")
         for item in data["by_category"]:
             pct = (item["total"] / data["expense"] * 100) if data["expense"] > 0 else 0
-            lines.append(
-                f"• {item['category']}: {format_money(item['total'])} ({pct:.0f}%)"
-            )
+            lines.append(f"• {item['category']}: {format_money(item['total'])} ({pct:.0f}%)")
     else:
         lines.append("Chưa có chi tiêu nào trong khoảng thời gian này.")
-
     return "\n".join(lines)
 
 
@@ -353,18 +365,13 @@ def format_daily_reminder(data: Dict) -> str:
 def format_wallets(wallets: list) -> str:
     if not wallets:
         return "📭 Bạn chưa có ví nào."
-
     lines = ["👛 **DANH SÁCH VÍ CỦA BẠN**\n"]
     total = 0.0
     for w in wallets:
         bal = float(w["balance"])
         total += bal
         emoji = "⭐" if w["is_default"] else "•"
-        icon = {
-            "cash": "💵", "bank": "🏦", "momo": "📱",
-            "zalopay": "💜", "credit": "💳"
-        }.get(w["type"], "👛")
+        icon = {"cash": "💵", "bank": "🏦", "momo": "📱", "zalopay": "💜", "credit": "💳"}.get(w["type"], "👛")
         lines.append(f"{emoji} {icon} **{w['name']}**: {format_money(bal)}")
-
     lines.append(f"\n💰 **Tổng cộng tất cả ví: {format_money(total)}**")
     return "\n".join(lines)
